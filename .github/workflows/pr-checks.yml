@@ -1,0 +1,185 @@
+# Reusable PR checks — the CI standard, defined once.
+#
+# Called by every consumer repo with `uses: nish3451/shared-workflows/.github/workflows/pr-checks.yml@v1`.
+# Updates on the `v1` branch propagate automatically to every consumer; no per-repo sync.
+#
+# Embodies the standing CI standard by construction:
+#   1. timeout-minutes on the job (item 1).
+#   2. concurrency + cancel-in-progress on PR/push only — this workflow only ever
+#      runs on PR/push (the caller's trigger), never on deploy/release/migration (item 2).
+#   3. dependency caching via setup-node `cache: npm` (item 3).
+#   4. one workflow per event — CI + secret scan batched into one job (item 4).
+#   5. expensive verify gated by a cheap changed-files check INSIDE the job, so the
+#      check always reports (a skipped step still leaves the job green) (item 5).
+#   6. fetch-depth: 0 — history IS needed here (git-diff changed-files filter + gitleaks
+#      commit scan), so the fetch-depth:1 rule does not apply (item 6 carve-out).
+#   7. gitleaks SARIF kept as a short-lived job artifact (retention-days below) (item 7).
+#   8. near-zero failures: deterministic breakage fails the job; no local retries; the
+#      scanner exit-code contract separates "leaks found" from "scanner error" (item 8).
+#   9. no scan dropped: gitleaks runs on EVERY PR, including docs-only (item 9).
+#  10. no CI that watches CI — this workflow only validates the PR in front of it (item 10).
+#
+# Secret scan uses the gitleaks BINARY directly (not gitleaks/gitleaks-action) because
+# gitleaks-action requires a GITLEAKS_LICENSE secret on organization repos (Nishfleet) and
+# fails with "missing gitleaks license" without it (verified 2026-08-24, run 32697545503).
+# The binary install needs no license, no secret, no actions cache — the same shape
+# aiconverter-app and fleet1-proof-sandbox already run at 0% failure.
+
+name: Reusable PR checks
+
+on:
+  workflow_call:
+    inputs:
+      node-version:
+        description: "Node version for setup-node (ignored when install-command is empty and no node step runs)."
+        type: string
+        required: false
+        default: "24"
+      install-command:
+        description: "Dependency install command (e.g. `npm ci`). Empty string skips install AND npm cache (use for repos with no package-lock.json)."
+        type: string
+        required: false
+        default: "npm ci"
+      verify-command:
+        description: "Test/build command run after install (e.g. `npm test && npm run build`). Empty string skips verify. Run on code-change PRs only."
+        type: string
+        required: false
+        default: "npm test"
+      python-version:
+        description: "Python version for setup-python. Empty string skips Python setup."
+        type: string
+        required: false
+        default: ""
+    secrets:
+      GITHUB_TOKEN:
+        required: false
+
+# One live run per PR head or main ref; a new push cancels the superseded run instead of
+# queueing behind it. Set here (not in the caller) so the standard applies by construction.
+concurrency:
+  group: pr-checks-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  pr-checks:
+    name: PR checks
+    runs-on: ubuntu-latest
+    # Bounds a hung step instead of letting it hold the concurrency group. ~3x a healthy
+    # code PR (install + test + build + scan); well under the 360m hosted cap.
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Detect code changes (docs-only fast path)
+        id: changes
+        env:
+          BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+          HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          set -euo pipefail
+          base="${BASE}"
+          if [ -z "$base" ] || [ "$base" = "0000000000000000000000000000000000000000" ]; then
+            # First commit on a branch / push with no prior ref: run everything.
+            echo "code=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # code = any changed path that is NOT a docs-only artifact. A docs-only PR
+          # skips install/test/build but still runs the secret scan below.
+          if git diff --name-only "$base" "${HEAD}" \
+            | grep -Eiv '\.(md|mdx|txt|rst|csv)$|^docs/|^\.lane/|^README|^CHANGELOG|^LICENSE|^\.git' \
+            | grep -q .; then
+            echo "code=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "code=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Set up Python
+        if: inputs.python-version != '' && steps.changes.outputs.code == 'true'
+        uses: actions/setup-python@42375524e23c412d93fb67b49958b491fce71c38 # v5
+        with:
+          python-version: ${{ inputs.python-version }}
+
+      - name: Set up Node (with npm cache)
+        if: steps.changes.outputs.code == 'true' && inputs.install-command != ''
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: npm
+
+      - name: Set up Node (no cache — no lockfile in this repo)
+        if: steps.changes.outputs.code == 'true' && inputs.install-command == ''
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: ${{ inputs.node-version }}
+
+      - name: Install dependencies
+        if: steps.changes.outputs.code == 'true' && inputs.install-command != ''
+        run: ${{ inputs.install-command }}
+
+      - name: Verify (test + build)
+        if: steps.changes.outputs.code == 'true' && inputs.verify-command != ''
+        run: ${{ inputs.verify-command }}
+
+      - name: Install Gitleaks
+        run: |
+          set -euo pipefail
+          mkdir -p "$GITHUB_WORKSPACE/.gitleaks"
+          curl -fsSL --retry 3 --retry-delay 2 \
+            -o "$GITHUB_WORKSPACE/.gitleaks/gitleaks.tgz" \
+            "https://github.com/gitleaks/gitleaks/releases/download/v8.24.3/gitleaks_8.24.3_linux_x64.tar.gz"
+          tar -xzf "$GITHUB_WORKSPACE/.gitleaks/gitleaks.tgz" -C "$GITHUB_WORKSPACE/.gitleaks"
+          "$GITHUB_WORKSPACE/.gitleaks/gitleaks" version
+
+      - name: Scan for secrets
+        env:
+          GITLEAKS_BIN: ${{ github.workspace }}/.gitleaks/gitleaks
+        run: |
+          set -uo pipefail
+          log_opts=""
+          case "$GITHUB_EVENT_NAME" in
+            pull_request)
+              log_opts="--no-merges --first-parent ${{ github.event.pull_request.base.sha }}..${{ github.event.pull_request.head.sha }}"
+              ;;
+            push)
+              if [ "${{ github.event.before }}" = "0000000000000000000000000000000000000000" ]; then
+                log_opts="-1"
+              else
+                log_opts="--no-merges --first-parent ${{ github.event.before }}..${GITHUB_SHA}"
+              fi
+              ;;
+          esac
+          args=(detect --redact -v --exit-code=2 --report-format=sarif --report-path=results.sarif)
+          if [ -n "$log_opts" ]; then
+            args+=(--log-opts "${log_opts}")
+          fi
+          set +e
+          "$GITLEAKS_BIN" "${args[@]}"
+          rc=$?
+          set -e
+          # Exit-code contract: 0 = clean, 2 = leaks found, anything else = scanner error.
+          if [ "$rc" -eq 0 ]; then
+            echo "No leaks detected"
+          elif [ "$rc" -eq 2 ]; then
+            echo "::error::Leaks detected — see results.sarif for details"
+            exit 1
+          else
+            echo "::error::Unexpected exit code [$rc] from gitleaks"
+            exit 1
+          fi
+
+      - name: Upload gitleaks SARIF (ephemeral)
+        if: always()
+        uses: actions/upload-artifact@97a0fba14028dd54b8b44c9ad1c7a94e330e8bd2 # v4.4.0
+        with:
+          name: gitleaks-sarif
+          path: results.sarif
+          retention-days: 7
+          if-no-files-found: ignore
