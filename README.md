@@ -82,12 +82,13 @@ fleet1-proof-sandbox already run at 0% failure.
 
 ## Why not GitHub "required workflows" / repository rulesets
 
-Those would enforce this centrally but are **organization-only**. Four of the five
-consumer repos live in the `Nishfleet` org (where they *could* be used), but
-`siterep` lives on the personal account `nish3451`, where they cannot. Reusable
-workflows from a public central repo is the one mechanism that covers **all** repos
-uniformly, personal and org, current and future. This repo is public so private
-consumer repos in both owners can call it.
+Those would enforce this centrally but are **organization-only**. All five
+consumer repos now live in the `Nishfleet` org (where they *could* be used),
+but `siterep` was on the personal account `nish3451` when this was designed,
+where they cannot — and the design must cover any future personal-account repo
+too. Reusable workflows from a public central repo is the one mechanism that
+covers **all** repos uniformly, personal and org, current and future. This repo
+is public so private consumer repos in any owner can call it.
 
 ## Versioning
 
