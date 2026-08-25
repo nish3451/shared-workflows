@@ -263,6 +263,9 @@ jobs:
 
       - name: Deploy (explicit command)
         if: steps.target.outputs.mode == 'command'
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
         run: ${{ steps.config.outputs.deploy-command }}
 
       - name: Deploy (Cloudflare Wrangler)
@@ -282,6 +285,9 @@ jobs:
 
       - name: Deploy (npm run deploy:production)
         if: steps.target.outputs.mode == 'script'
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
         run: npm run deploy:production
 
       - name: No deploy target declared
