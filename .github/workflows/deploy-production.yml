@@ -22,10 +22,15 @@
 #       uses: nish3451/shared-workflows/.github/workflows/deploy-production.yml@v1
 #       secrets: inherit
 #       with:
-#         node-version: "24"            # optional
-#         build-command: npm run build  # optional
-#         deploy-command: ""            # optional; empty = auto-detect
-#         health-url: ""                # optional; empty = skip health check
+#         node-version: "24"            # optional; empty = config file or default 24
+#         build-command: npm run build  # optional; empty = config file or skip
+#         deploy-command: ""            # optional; empty = config file or auto-detect
+#         health-url: ""                # optional; empty = config file or skip
+#
+# Per-repo settings can also live in `.github/deploy-config.json` (keys:
+# build_command, deploy_command, health_url, node_version — all optional
+# strings). Precedence: explicit `with:` input (non-empty) > config file >
+# default. A caller can drop all `with:` inputs and let the config file drive.
 #
 # Concurrency is deliberately NOT set here. The CALLING workflow owns
 # concurrency and MUST use `cancel-in-progress: false`. Deploy/release
@@ -49,10 +54,10 @@ on:
   workflow_call:
     inputs:
       node-version:
-        description: "Node version for setup-node (used by every deploy path that needs Node)."
+        description: "Node version for setup-node. Empty = fall back to .github/deploy-config.json, then '24'."
         type: string
         required: false
-        default: "24"
+        default: ""
       build-command:
         description: "Build command run before deploy (e.g. `npm run build`). Empty string skips build."
         type: string
@@ -153,6 +158,52 @@ jobs:
           echo "::error::checks not green — refusing to deploy (one or more checks on ${{ github.sha }} failed, cancelled, or timed out)"
           exit 1
 
+      # ---- PER-REPO CONFIG -----------------------------------------------
+      # Read optional .github/deploy-config.json (keys: build_command,
+      # deploy_command, health_url, node_version — all optional strings) and
+      # resolve each setting with precedence:
+      #   explicit workflow_call input (non-empty) > config file value > default
+      # Defaults: node_version=24, build_command="", deploy_command="",
+      # health_url="". Resolved values are emitted as step outputs and consumed
+      # by every downstream step instead of raw inputs, so a caller can drop all
+      # `with:` inputs and let the repo-local config file drive deploys.
+      - name: Resolve per-repo deploy config
+        id: config
+        env:
+          INPUT_NODE_VERSION: ${{ inputs.node-version }}
+          INPUT_BUILD_COMMAND: ${{ inputs.build-command }}
+          INPUT_DEPLOY_COMMAND: ${{ inputs.deploy-command }}
+          INPUT_HEALTH_URL: ${{ inputs.health-url }}
+        run: |
+          set -euo pipefail
+          node_version=""
+          build_command=""
+          deploy_command=""
+          health_url=""
+          if [ -f .github/deploy-config.json ]; then
+            node_version=$(jq -r '.node_version // empty' .github/deploy-config.json 2>/dev/null || true)
+            build_command=$(jq -r '.build_command // empty' .github/deploy-config.json 2>/dev/null || true)
+            deploy_command=$(jq -r '.deploy_command // empty' .github/deploy-config.json 2>/dev/null || true)
+            health_url=$(jq -r '.health_url // empty' .github/deploy-config.json 2>/dev/null || true)
+            echo "Loaded .github/deploy-config.json"
+          else
+            echo "No .github/deploy-config.json — using inputs/defaults only"
+          fi
+          # Precedence: explicit input (non-empty) > config file > default.
+          [ -n "$INPUT_NODE_VERSION" ] && node_version="$INPUT_NODE_VERSION"
+          [ -n "$INPUT_BUILD_COMMAND" ] && build_command="$INPUT_BUILD_COMMAND"
+          [ -n "$INPUT_DEPLOY_COMMAND" ] && deploy_command="$INPUT_DEPLOY_COMMAND"
+          [ -n "$INPUT_HEALTH_URL" ] && health_url="$INPUT_HEALTH_URL"
+          # Final defaults for anything still empty.
+          [ -z "$node_version" ] && node_version="24"
+          {
+            echo "node-version=$node_version"
+            echo "build-command=$build_command"
+            echo "deploy-command=$deploy_command"
+            echo "health-url=$health_url"
+          } >> "$GITHUB_OUTPUT"
+          echo "Resolved: node=$node_version build=[$build_command] deploy=[$deploy_command] health=[$health_url]"
+
       # ---- DEPLOY RESOLUTION ---------------------------------------------
       # Ladder: explicit deploy-command > wrangler config > deploy:production
       # script > nothing-to-deploy (skip green). This file is synced to every
@@ -160,7 +211,7 @@ jobs:
       - name: Resolve deploy target
         id: target
         env:
-          DEPLOY_COMMAND: ${{ inputs.deploy-command }}
+          DEPLOY_COMMAND: ${{ steps.config.outputs.deploy-command }}
         run: |
           set -euo pipefail
           mode=skip
@@ -182,26 +233,26 @@ jobs:
         if: steps.target.outputs.mode != 'skip' && steps.target.outputs.has-lockfile == 'true'
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
-          node-version: ${{ inputs.node-version }}
+          node-version: ${{ steps.config.outputs.node-version }}
           cache: npm
 
       - name: Set up Node (no cache — no lockfile in this repo)
         if: steps.target.outputs.mode != 'skip' && steps.target.outputs.has-lockfile != 'true'
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
-          node-version: ${{ inputs.node-version }}
+          node-version: ${{ steps.config.outputs.node-version }}
 
       - name: Install dependencies
         if: steps.target.outputs.mode != 'skip' && steps.target.outputs.has-package == 'true'
         run: npm ci
 
       - name: Build
-        if: steps.target.outputs.mode != 'skip' && inputs.build-command != ''
-        run: ${{ inputs.build-command }}
+        if: steps.target.outputs.mode != 'skip' && steps.config.outputs.build-command != ''
+        run: ${{ steps.config.outputs.build-command }}
 
       - name: Deploy (explicit command)
         if: steps.target.outputs.mode == 'command'
-        run: ${{ inputs.deploy-command }}
+        run: ${{ steps.config.outputs.deploy-command }}
 
       - name: Deploy (Cloudflare Wrangler)
         if: steps.target.outputs.mode == 'wrangler'
@@ -230,10 +281,10 @@ jobs:
       # curl with -fsS, 3 retries with backoff, require HTTP 200. Skipped
       # silently when health-url is empty.
       - name: Health check
-        if: inputs.health-url != ''
+        if: steps.config.outputs.health-url != ''
         run: |
           set -uo pipefail
-          url="${{ inputs.health-url }}"
+          url="${{ steps.config.outputs.health-url }}"
           ok=0
           for i in 1 2 3; do
             code=$(curl -fsS -o /dev/null -w '%{http_code}' "$url" 2>/dev/null) || code="000"
