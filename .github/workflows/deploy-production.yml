@@ -1,0 +1,251 @@
+# Reusable deploy-on-green production deploy workflow — the fleet standard,
+# defined once (Nish, 2026-08-25).
+#
+# Mechanical deploy-on-green: callers trigger this on `push: branches: [main]`
+# (i.e. after a PR merges) and pass `secrets: inherit`. This workflow waits for
+# every OTHER check on that SHA to go green, then deploys, then health-checks.
+# It never merges, never releases, never cancels itself.
+#
+# Trigger model — `on: workflow_call` only. A consumer repo drops in a caller
+# workflow like:
+#
+#   name: Deploy production
+#   on:
+#     push:
+#       branches: [main]
+#   permissions:
+#     contents: read
+#     checks: read
+#     actions: read
+#   jobs:
+#     deploy:
+#       uses: nish3451/shared-workflows/.github/workflows/deploy-production.yml@v1
+#       secrets: inherit
+#       with:
+#         node-version: "24"            # optional
+#         build-command: npm run build  # optional
+#         deploy-command: ""            # optional; empty = auto-detect
+#         health-url: ""                # optional; empty = skip health check
+#
+# Concurrency is deliberately NOT set here. The CALLING workflow owns
+# concurrency and MUST use `cancel-in-progress: false`. Deploy/release
+# workflows must never cancel a run mid-flight — a half-deploy is worse than a
+# queued one. (pr-checks.yml uses cancel-in-progress: true because it only
+# validates a PR; deploy is the opposite case and the standing rule forbids
+# cancel-in-progress on deploy/release.)
+#
+# Self-exclusion note: lewagon/wait-on-check-action's `running-workflow-name`
+# matches a check name by EXACT equality (verified in its source, v1.9.1), and
+# GitHub formats a reusable-workflow job's check name as
+# "<caller-job> / <callee-job>" (verified empirically against actions/setup-node
+# check-runs). The caller-job half is unknown here, so an exact string cannot
+# reliably exclude this job. We set `running-workflow-name` for intent AND use
+# `check-regexp` with a negative lookahead on this job's name token
+# ("deploy-on-green") as the working self-exclusion.
+
+name: Reusable deploy-on-green production deploy
+
+on:
+  workflow_call:
+    inputs:
+      node-version:
+        description: "Node version for setup-node (used by every deploy path that needs Node)."
+        type: string
+        required: false
+        default: "24"
+      build-command:
+        description: "Build command run before deploy (e.g. `npm run build`). Empty string skips build."
+        type: string
+        required: false
+        default: ""
+      deploy-command:
+        description: "Explicit deploy command. When non-empty, runs after build and wins over auto-detection. Empty string = auto-detect (wrangler config, then a `deploy:production` script)."
+        type: string
+        required: false
+        default: ""
+      health-url:
+        description: "URL to curl (expect HTTP 200) after a successful deploy. Empty string skips the health check."
+        type: string
+        required: false
+        default: ""
+
+# No `secrets:` block: callers pass `secrets: inherit`, so inherited secrets
+# (CLOUDFLARE_API_TOKEN, CLOUDFLARE_ACCOUNT_ID) are referenceable here without
+# being declared. GITHUB_TOKEN is always available automatically.
+
+permissions:
+  contents: read
+  checks: read
+  actions: read
+
+jobs:
+  deploy:
+    name: deploy-on-green
+    runs-on: ubuntu-latest
+    # Bounds a hung deploy/health step instead of holding a runner indefinitely.
+    # ~3x a healthy build+deploy+health; well under the 360m hosted cap.
+    timeout-minutes: 15
+    steps:
+      - name: Checkout (triggering SHA)
+        uses: actions/checkout@11d5960a326750d5838078e84afbd3f7d6820022 # v4.4.0
+        with:
+          ref: ${{ github.sha }}
+          # Deploy needs the tree at the triggering commit, not history.
+          fetch-depth: 1
+          persist-credentials: false
+
+      # ---- GREEN GATE -----------------------------------------------------
+      # Wait for every OTHER check on this SHA to complete successfully before
+      # deploying. Self is excluded by name token (see header note). If zero
+      # other checks are found after a discovery window, proceed with a loud
+      # warning — branch protection gated the PR in that case. Any
+      # failed/cancelled/timed-out check fails this job with
+      # "checks not green — refusing to deploy".
+      - name: Discover other checks on this SHA
+        id: discover
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          token="deploy-on-green"
+          deadline=$(( $(date +%s) + 90 ))
+          while [ "$(date +%s)" -lt "$deadline" ]; do
+            mapfile -t all < <(gh api "repos/${GITHUB_REPOSITORY}/commits/${SHA}/check-runs?per_page=100" --jq '.check_runs[].name' 2>/dev/null || true)
+            other=()
+            for n in "${all[@]+\"${all[@]}\"}"; do
+              case "$n" in *"$token"*) ;; *) other+=("$n") ;; esac
+            done
+            if [ "${#other[@]}" -gt 0 ]; then
+              echo "other-checks=${#other[@]}" >> "$GITHUB_OUTPUT"
+              echo "Found ${#other[@]} other check(s) on ${SHA}:"
+              for n in "${other[@]}"; do echo "  - $n"; done
+              exit 0
+            fi
+            echo "No other checks registered yet; polling again in 15s..."
+            sleep 15
+          done
+          echo "other-checks=0" >> "$GITHUB_OUTPUT"
+          echo "::warning::No other checks found on ${SHA} after 90s — branch protection gated the PR; proceeding with deploy."
+
+      - name: Wait for other checks to go green
+        id: green-gate
+        if: steps.discover.outputs.other-checks != '0'
+        uses: lewagon/wait-on-check-action@369769072fe522a3a8a85c03c96af1e5242a1994 # v1.9.1
+        with:
+          ref: ${{ github.sha }}
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+          # Intent: exclude this job. See header note for why this alone is not
+          # enough in a reusable workflow; check-regexp below does the actual
+          # self-exclusion.
+          running-workflow-name: deploy-on-green
+          check-regexp: '\A(?:(?!deploy-on-green).)*\z'
+          # success = green; skipped = a check that didn't run (not a failure).
+          # failure/cancelled/timed_out/action_required/neutral/stale => fail.
+          allowed-conclusions: success,skipped
+          wait-interval: 15
+          fail-on-no-checks: true
+          verbose: true
+
+      - name: Refuse deploy on non-green checks
+        if: failure() && steps.discover.outputs.other-checks != '0'
+        run: |
+          echo "::error::checks not green — refusing to deploy (one or more checks on ${{ github.sha }} failed, cancelled, or timed out)"
+          exit 1
+
+      # ---- DEPLOY RESOLUTION ---------------------------------------------
+      # Ladder: explicit deploy-command > wrangler config > deploy:production
+      # script > nothing-to-deploy (skip green). This file is synced to every
+      # repo, so the skip case must stay green and quiet for non-deployable repos.
+      - name: Resolve deploy target
+        id: target
+        env:
+          DEPLOY_COMMAND: ${{ inputs.deploy-command }}
+        run: |
+          set -euo pipefail
+          mode=skip
+          if [ -n "$DEPLOY_COMMAND" ]; then
+            mode=command
+          elif [ -f wrangler.toml ] || [ -f wrangler.jsonc ] || [ -f wrangler.json ]; then
+            mode=wrangler
+          elif [ -f package.json ] && jq -e '.scripts."deploy:production"' package.json >/dev/null 2>&1; then
+            mode=script
+          else
+            mode=skip
+          fi
+          echo "mode=${mode}" >> "$GITHUB_OUTPUT"
+          if [ -f package.json ]; then echo "has-package=true" >> "$GITHUB_OUTPUT"; else echo "has-package=false" >> "$GITHUB_OUTPUT"; fi
+          if [ -f package-lock.json ]; then echo "has-lockfile=true" >> "$GITHUB_OUTPUT"; else echo "has-lockfile=false" >> "$GITHUB_OUTPUT"; fi
+          echo "Resolved deploy mode: ${mode}"
+
+      - name: Set up Node (with npm cache)
+        if: steps.target.outputs.mode != 'skip' && steps.target.outputs.has-lockfile == 'true'
+        uses: actions/setup-node@499335ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: npm
+
+      - name: Set up Node (no cache — no lockfile in this repo)
+        if: steps.target.outputs.mode != 'skip' && steps.target.outputs.has-lockfile != 'true'
+        uses: actions/setup-node@499335ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: ${{ inputs.node-version }}
+
+      - name: Install dependencies
+        if: steps.target.outputs.mode != 'skip' && steps.target.outputs.has-package == 'true'
+        run: npm ci
+
+      - name: Build
+        if: steps.target.outputs.mode != 'skip' && inputs.build-command != ''
+        run: ${{ inputs.build-command }}
+
+      - name: Deploy (explicit command)
+        if: steps.target.outputs.mode == 'command'
+        run: ${{ inputs.deploy-command }}
+
+      - name: Deploy (Cloudflare Wrangler)
+        if: steps.target.outputs.mode == 'wrangler'
+        env:
+          CF_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CF_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          set -euo pipefail
+          if [ -z "$CF_API_TOKEN" ]; then
+            echo "::error::CLOUDFLARE_API_TOKEN secret is empty — cannot deploy to Cloudflare"
+            exit 1
+          fi
+          export CLOUDFLARE_API_TOKEN="$CF_API_TOKEN"
+          export CLOUDFLARE_ACCOUNT_ID="$CF_ACCOUNT_ID"
+          npx wrangler deploy
+
+      - name: Deploy (npm run deploy:production)
+        if: steps.target.outputs.mode == 'script'
+        run: npm run deploy:production
+
+      - name: No deploy target declared
+        if: steps.target.outputs.mode == 'skip'
+        run: echo "no deploy target declared — nothing to deploy, skipping"
+
+      # ---- HEALTH CHECK ---------------------------------------------------
+      # curl with -fsS, 3 retries with backoff, require HTTP 200. Skipped
+      # silently when health-url is empty.
+      - name: Health check
+        if: inputs.health-url != ''
+        run: |
+          set -uo pipefail
+          url="${{ inputs.health-url }}"
+          ok=0
+          for i in 1 2 3; do
+            code=$(curl -fsS -o /dev/null -w '%{http_code}' "$url" 2>/dev/null) || code="000"
+            if [ "$code" = "200" ]; then
+              ok=1
+              break
+            fi
+            echo "Health check attempt ${i}: HTTP ${code}; backing off $((i*10))s..."
+            sleep $((i*10))
+          done
+          if [ "$ok" != "1" ]; then
+            echo "::error::Health check failed for ${url} (expected HTTP 200) after 3 attempts"
+            exit 1
+          fi
+          echo "Health check passed (HTTP 200)"
