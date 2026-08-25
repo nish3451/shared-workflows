@@ -87,7 +87,7 @@ jobs:
     timeout-minutes: 15
     steps:
       - name: Checkout (triggering SHA)
-        uses: actions/checkout@11d5960a326750d5838078e84afbd3f7d6820022 # v4.4.0
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           ref: ${{ github.sha }}
           # Deploy needs the tree at the triggering commit, not history.
@@ -180,14 +180,14 @@ jobs:
 
       - name: Set up Node (with npm cache)
         if: steps.target.outputs.mode != 'skip' && steps.target.outputs.has-lockfile == 'true'
-        uses: actions/setup-node@499335ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: ${{ inputs.node-version }}
           cache: npm
 
       - name: Set up Node (no cache — no lockfile in this repo)
         if: steps.target.outputs.mode != 'skip' && steps.target.outputs.has-lockfile != 'true'
-        uses: actions/setup-node@499335ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: ${{ inputs.node-version }}
 
