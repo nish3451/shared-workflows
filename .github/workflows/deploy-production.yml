@@ -2,9 +2,10 @@
 # defined once (Nish, 2026-08-25).
 #
 # Mechanical deploy-on-green: callers trigger this on `push: branches: [main]`
-# (i.e. after a PR merges) and pass `secrets: inherit`. This workflow waits for
-# every OTHER check on that SHA to go green, then deploys, then health-checks.
-# It never merges, never releases, never cancels itself.
+# (i.e. after a PR merges) and pass secrets explicitly (least privilege — the
+# semgrep `secrets-inherit` rule blocks `secrets: inherit` fleet-wide). This
+# workflow waits for every OTHER check on that SHA to go green, then deploys,
+# then health-checks. It never merges, never releases, never cancels itself.
 #
 # Trigger model — `on: workflow_call` only. A consumer repo drops in a caller
 # workflow like:
@@ -20,7 +21,9 @@
 #   jobs:
 #     deploy:
 #       uses: nish3451/shared-workflows/.github/workflows/deploy-production.yml@v1
-#       secrets: inherit
+#       secrets:
+#         CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+#         CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
 #       with:
 #         node-version: "24"            # optional; empty = config file or default 24
 #         build-command: npm run build  # optional; empty = config file or skip
@@ -73,10 +76,18 @@ on:
         type: string
         required: false
         default: ""
+    secrets:
+      CLOUDFLARE_API_TOKEN:
+        description: "Cloudflare API token for wrangler deploys (optional; only the wrangler path needs it)."
+        required: false
+      CLOUDFLARE_ACCOUNT_ID:
+        description: "Cloudflare account id for wrangler deploys (optional)."
+        required: false
 
-# No `secrets:` block: callers pass `secrets: inherit`, so inherited secrets
-# (CLOUDFLARE_API_TOKEN, CLOUDFLARE_ACCOUNT_ID) are referenceable here without
-# being declared. GITHUB_TOKEN is always available automatically.
+# Secrets are declared above so callers can pass them explicitly (least
+# privilege) instead of `secrets: inherit`. CLOUDFLARE_API_TOKEN and
+# CLOUDFLARE_ACCOUNT_ID are referenced by the wrangler deploy step below.
+# GITHUB_TOKEN is always available automatically.
 
 permissions:
   contents: read
