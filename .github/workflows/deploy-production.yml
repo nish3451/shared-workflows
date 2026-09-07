@@ -99,8 +99,13 @@ jobs:
     name: deploy-on-green
     runs-on: ubuntu-latest
     # Bounds a hung deploy/health step instead of holding a runner indefinitely.
-    # ~3x a healthy build+deploy+health; well under the 360m hosted cap.
-    timeout-minutes: 15
+    # Must exceed the slowest OTHER check the green gate waits on: the fleet
+    # P14 suite routinely runs ~15.5m (its own job timeout is 20m), so a 15m
+    # timeout here made the deploy job time out and get cancelled while still
+    # waiting for P14 — a cancelled required check turned statusCheckRollup
+    # FAILURE and tripped FleetMainRed (fleet-ops#4379-era race). 30m is ~2x
+    # the P14 runtime, still well under the 360m hosted cap.
+    timeout-minutes: 30
     steps:
       - name: Checkout (triggering SHA)
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
